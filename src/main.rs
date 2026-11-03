@@ -79,8 +79,15 @@ const APP_ID: &str = "shotrs";
 /// 内嵌的图标（1024 太大，256 足够窗口图标；.desktop 用 assets/ 下的大图）
 const ICON_PNG: &[u8] = include_bytes!("../assets/shotrs-256.png");
 
-/// 控制窗口的逻辑尺寸
-const CONTROL_SIZE: LogicalSize<f64> = LogicalSize::new(480.0, 424.0);
+/// 控制窗口的初始逻辑尺寸。高度只是起点：`ui_control` 会按实际内容
+/// 调成「内容 + 上下 CONTROL_PAD」，这样四边留白永远相等
+const CONTROL_SIZE: LogicalSize<f64> = LogicalSize::new(480.0, 472.0);
+/// 控制窗口四周留白：左右上下用同一个值，别到处写魔法数字
+const CONTROL_PAD: f32 = 18.0;
+/// 控制窗口圆角半径。窗口本身是透明的（Idle 时清成 alpha=0），圆角外直接透出桌面
+const CONTROL_RADIUS: u8 = 14;
+/// 分组之间的额外间距（行距由 `item_spacing.y` 统一控制）
+const SECTION_GAP: f32 = 8.0;
 
 /// 取帧前等多久：让自己的「透明帧」被合成器真正合成一次，再让 portal 去拍。
 /// 无需很久 —— 隐身靠的是下面 hiding() 里的 alpha=0，不是 unmap。
@@ -811,6 +818,27 @@ impl App {
         }
     }
 
+    /// 「重选」：清掉当前选区，回到框选阶段。
+    ///
+    /// 为什么需要它：全屏截图（单击 = 全屏）之后选区就是整个屏幕，没有「外面」可以
+    /// 重新拖框，而平移又会被夹回屏幕 —— 看起来就是「缩小不了」。这里给一条显式退路，
+    /// 按钮（右上角）和 `Shift+R` 都走它。标注不清，重新框选后仍在（只是可能被裁掉）。
+    fn reset_selection(&mut self) {
+        if !matches!(self.phase, Phase::Select | Phase::Annotate) {
+            return;
+        }
+        self.sel = None;
+        self.sel_start = None;
+        self.sel_base = None;
+        self.grab = None;
+        self.drag_shape = None;
+        self.resize_shape = None;
+        self.scene.selected = None;
+        self.phase = Phase::Select;
+        self.status = String::from("已重置选区：拖出一块新区域（单击 = 全屏）");
+        eprintln!("[shotrs] 重置选区，回到框选阶段");
+    }
+
     /// 全屏尺寸生效后，把 pending 帧裁成当前屏、切瓦片、进框选阶段
     fn resolve_pending(&mut self, window: &Window) {
         let Some(mut frame) = self.pending.take() else {
@@ -977,6 +1005,22 @@ impl App {
             return;
         }
 
+        // 每帧把 GL surface 对齐到当前 inner_size。
+        //
+        // `request_inner_size` 会**立刻**更新 winit 的 inner_size，但不一定马上发
+        // `Resized`（Wayland 普通窗口的 buffer 尺寸由客户端决定）。如果这一帧就按
+        // 新尺寸绘制，framebuffer 还是旧的 → 画面整体往下掉一条透明黑边
+        // （实测：控制窗口自动调高后，顶部 68px 全透明）。这里幂等地 resize 一次。
+        if let Some(gl) = self.gl.as_ref() {
+            if let Some((surface, context)) = gl.live.as_ref() {
+                if let (Some(w), Some(h)) =
+                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+                {
+                    surface.resize(context, w, h);
+                }
+            }
+        }
+
         self.desktop_scale = self.desktop_scale.max(window.scale_factor() as f32);
 
         self.resolve_pending(window);
@@ -1056,7 +1100,15 @@ impl App {
             };
 
             // Wayland 的 buffer 是预乘 alpha：全透明 = (0,0,0,0)
-            let (r_, g_, b_, alpha) = if hiding { (0.0, 0.0, 0.0, 0.0) } else { (0.0, 0.0, 0.0, 1.0) };
+            //
+            // Idle 也要透明：控制窗口的圆角是靠「圆角底色 + 透明四角」做的，
+            // 这里如果清成不透明黑，合成器就会把四个角又填成直角。
+            let transparent = hiding || matches!(self.phase, Phase::Idle);
+            let (r_, g_, b_, alpha) = if transparent {
+                (0.0, 0.0, 0.0, 0.0)
+            } else {
+                (0.0, 0.0, 0.0, 1.0)
+            };
             unsafe {
                 gl.gl.clear_color(r_, g_, b_, alpha);
                 gl.gl.clear(glow::COLOR_BUFFER_BIT);
@@ -1152,7 +1204,13 @@ impl App {
     }
 
     /// 画布上的光标形状：把「按下时会做什么」如实反映出来
-    fn canvas_cursor(&self, sel: Rect, p: Pos2, space_held: bool) -> egui::CursorIcon {
+    fn canvas_cursor(
+        &self,
+        sel: Rect,
+        p: Pos2,
+        space_held: bool,
+        screen: Rect,
+    ) -> egui::CursorIcon {
         if self.point_over_delete(p, sel) {
             return egui::CursorIcon::PointingHand;
         }
@@ -1164,10 +1222,15 @@ impl App {
                 return h.cursor();
             }
         }
-        match selection::hit(sel, p) {
+        match selection::hit_selection(sel, p, screen) {
             selection::Hit::Handle(h) => h.cursor(),
             selection::Hit::Inside if self.toolbox.active().is_selection_tool() || space_held => {
-                egui::CursorIcon::Grab
+                if selection::covers_screen(sel, screen) {
+                    // 全屏选区：拖内部 = 重新框选，不是平移（平移会被夹回屏幕，等于没反应）
+                    egui::CursorIcon::Crosshair
+                } else {
+                    egui::CursorIcon::Grab
+                }
             }
             selection::Hit::Inside if self.scene.hit(p).is_some() => egui::CursorIcon::Move,
             _ => egui::CursorIcon::Crosshair,
@@ -1229,50 +1292,77 @@ impl App {
     fn ui_control(&mut self, ctx: &egui::Context, window: &Window) {
         let screen = ctx.viewport_rect();
 
-        // 背景自己画：这块不依赖任何 panel/frame API，尺寸永远和窗口一致
-        ctx.layer_painter(egui::LayerId::background())
-            .rect_filled(screen, CornerRadius::ZERO, BG);
+        // 圆角是靠「窗口透明 + 圆角底色」做的：Idle 时 redraw 把 framebuffer
+        // 清成 (0,0,0,0)，所以这里只要画一个圆角矩形，四角就会透出桌面。
+        // 别再拿整个 screen 做不透明填充，那会把圆角盖成直角。
+        let bg = ctx.layer_painter(egui::LayerId::background());
+        bg.rect_filled(screen, CornerRadius::same(CONTROL_RADIUS), BG);
+        // 一圈很淡的描边，深色桌面上也有轮廓
+        bg.rect_stroke(
+            screen,
+            CornerRadius::same(CONTROL_RADIUS),
+            Stroke::new(1.0, Color32::from_rgb(46, 48, 58)),
+            StrokeKind::Inside,
+        );
 
-        egui::Area::new(egui::Id::unique("shotrs-control"))
-            .fixed_pos(screen.min + Vec2::new(16.0, 14.0))
+        // 四周留白全部由 PAD 算出来，不各写一个偏移
+        let body = Rect::from_min_max(
+            screen.min + Vec2::splat(CONTROL_PAD),
+            screen.max - Vec2::splat(CONTROL_PAD),
+        );
+
+        let area = egui::Area::new(egui::Id::unique("shotrs-control"))
+            .fixed_pos(body.min)
             .show(ctx, |ui| {
-                ui.set_width((screen.width() - 32.0).max(120.0));
+                ui.set_width(body.width());
+                // 行距 / 控件内边距统一：默认 item_spacing.y 只有 3pt，行与行太挤
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 6.0);
+                ui.spacing_mut().button_padding = Vec2::new(9.0, 4.0);
+                ui.spacing_mut().interact_size.y = 22.0;
 
                 // 标题条 = 拖动区 + 两个窗口按钮。
                 // 无边框窗口只能靠 xdg_toplevel.move 拖动（Wayland 下 set_outer_position 无效）。
+                //
+                // 按钮从右往左摆：`add_sized` 只是「格子」大小，按钮自己的矩形是
+                // 文字 + button_padding，实际宽度会略大于格子（DPI 越大越明显）。
+                // 先占右边，剩下的宽度给标题拖动条，右边留白才永远是 CONTROL_PAD。
                 ui.horizontal(|ui| {
                     let btn = Vec2::new(26.0, 24.0);
-                    let drag_w = (ui.available_width() - btn.x * 2.0 - 12.0).max(60.0);
-                    let bar = ui.allocate_response(Vec2::new(drag_w, 30.0), egui::Sense::drag());
-                    if bar.drag_started() {
-                        let _ = window.drag_window();
-                    }
-                    ui.painter().text(
-                        Pos2::new(bar.rect.left() + 2.0, bar.rect.center().y),
-                        Align2::LEFT_CENTER,
-                        "shotrs",
-                        FontId::proportional(20.0),
-                        ACCENT,
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized(btn, egui::Button::new(RichText::new("×").size(16.0)))
+                            .on_hover_text(if self.config.close_to_tray {
+                                "关闭 = 收进托盘（可在下面改）"
+                            } else {
+                                "关闭 = 退出程序（可在下面改）"
+                            })
+                            .clicked()
+                        {
+                            self.pending_close = true;
+                        }
+                        if ui
+                            .add_sized(btn, egui::Button::new(RichText::new("—").size(14.0)))
+                            .on_hover_text("最小化到托盘（Wayland 窗口最小化无法恢复，所以这里是销毁窗口、进程留后台）")
+                            .clicked()
+                        {
+                            self.pending_minimize = true;
+                        }
 
-                    if ui
-                        .add_sized(btn, egui::Button::new(RichText::new("—").size(14.0)))
-                        .on_hover_text("最小化到托盘（Wayland 窗口最小化无法恢复，所以这里是销毁窗口、进程留后台）")
-                        .clicked()
-                    {
-                        self.pending_minimize = true;
-                    }
-                    if ui
-                        .add_sized(btn, egui::Button::new(RichText::new("×").size(16.0)))
-                        .on_hover_text(if self.config.close_to_tray {
-                            "关闭 = 收进托盘（可在下面改）"
-                        } else {
-                            "关闭 = 退出程序（可在下面改）"
-                        })
-                        .clicked()
-                    {
-                        self.pending_close = true;
-                    }
+                        let bar = ui.allocate_response(
+                            Vec2::new(ui.available_width(), 30.0),
+                            egui::Sense::drag(),
+                        );
+                        if bar.drag_started() {
+                            let _ = window.drag_window();
+                        }
+                        ui.painter().text(
+                            Pos2::new(bar.rect.left() + 2.0, bar.rect.center().y),
+                            Align2::LEFT_CENTER,
+                            "shotrs",
+                            FontId::proportional(20.0),
+                            ACCENT,
+                        );
+                    });
                 });
 
                 ui.label(
@@ -1280,7 +1370,7 @@ impl App {
                         .size(12.0)
                         .color(FG_DIM),
                 );
-                ui.add_space(12.0);
+                ui.add_space(SECTION_GAP);
 
                 let btn = egui::Button::new(RichText::new("截图").size(16.0))
                     .min_size(Vec2::new(ui.available_width(), 40.0));
@@ -1292,7 +1382,7 @@ impl App {
                     self.start_capture(window);
                 }
 
-                ui.add_space(10.0);
+                ui.add_space(SECTION_GAP);
                 ui.label(RichText::new(&self.status).size(11.0).color(FG_DIM));
                 if !self.image_note.is_empty() {
                     ui.label(
@@ -1301,6 +1391,7 @@ impl App {
                             .color(Color32::from_rgb(110, 115, 125)),
                     );
                 }
+                ui.add_space(SECTION_GAP);
 
                 // ---- 截哪块屏：从托盘/快捷键触发时窗口是新建的，合成器一般把它放主屏，
                 // 不显式指定就只能截主屏（以前得先把窗口拖到副屏）。
@@ -1340,7 +1431,7 @@ impl App {
                     }
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(SECTION_GAP);
                 // ---- 剪贴板载荷：本机 / RDP 图像 / RDP 文件 / VNC 路径，能力不一样
                 ui.label(
                     RichText::new("Enter 复制的内容")
@@ -1407,27 +1498,33 @@ impl App {
                 });
 
                 // ---- 配置区：保存目录（点「保存」按钮才用到）+ 写回 JSON
+                ui.add_space(SECTION_GAP);
                 ui.label(
                     RichText::new("保存目录（点「保存」时用）")
                         .size(10.0)
                         .color(Color32::from_rgb(120, 125, 140)),
                 );
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.save_dir_text)
-                            .desired_width(ui.available_width() - 62.0)
-                            .font(FontId::proportional(12.0)),
-                    );
-                    let apply_btn = ui.add(egui::Button::new(RichText::new("应用").size(11.0)));
-                    if apply_btn.clicked() {
-                        self.config.save_dir = PathBuf::from(self.save_dir_text.trim());
-                        let msg = match self.config.save() {
-                            Ok(()) => format!("配置已写入 {}", Config::path().display()),
-                            Err(e) => format!("配置写入失败：{e}"),
-                        };
-                        eprintln!("[shotrs] {msg}");
-                        self.status = msg;
-                    }
+                    // 应用按钮先占右侧，输入框用剩下的宽度：按钮的「字宽 + padding」
+                    // 受 DPI/字体影响，用 `available - 62` 硬估会把右边留白吃掉
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let apply_btn = ui.add(egui::Button::new(RichText::new("应用").size(11.0)));
+                        let w = ui.available_width();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.save_dir_text)
+                                .desired_width(w)
+                                .font(FontId::proportional(12.0)),
+                        );
+                        if apply_btn.clicked() {
+                            self.config.save_dir = PathBuf::from(self.save_dir_text.trim());
+                            let msg = match self.config.save() {
+                                Ok(()) => format!("配置已写入 {}", Config::path().display()),
+                                Err(e) => format!("配置写入失败：{e}"),
+                            };
+                            eprintln!("[shotrs] {msg}");
+                            self.status = msg;
+                        }
+                    });
                 });
                 ui.label(
                     RichText::new(format!("配置文件 {}", Config::path().display()))
@@ -1436,6 +1533,7 @@ impl App {
                 );
 
                 // ---- 关闭按钮行为
+                ui.add_space(SECTION_GAP);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("关闭按钮")
@@ -1488,28 +1586,33 @@ impl App {
                 // 可直接粘进「设置 → 键盘 → 自定义快捷键」的命令
                 ui.horizontal(|ui| {
                     let cmd = format!("{} --screenshot", exe_path());
-                    ui.add(
-                        egui::TextEdit::singleline(&mut cmd.clone())
-                            .desired_width(ui.available_width() - 64.0)
-                            .font(FontId::monospace(10.0)),
-                    );
-                    if ui
-                        .add(egui::Button::new(RichText::new("复制命令").size(10.0)))
-                        .on_hover_text(format!(
-                            "复制后到 设置 → 键盘 → 自定义快捷键 → +，粘到「命令」里\n（命令通道：{}）",
-                            self.ipc_path
-                        ))
-                        .clicked()
-                    {
-                        self.status = match utils::clipboard::copy(
-                            utils::clipboard::Payload::Text(cmd.clone()),
-                        ) {
-                            Ok(_) => format!("已复制命令：{cmd}"),
-                            Err(e) => format!("复制失败：{e}"),
-                        };
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let copy_btn = ui
+                            .add(egui::Button::new(RichText::new("复制命令").size(10.0)))
+                            .on_hover_text(format!(
+                                "复制后到 设置 → 键盘 → 自定义快捷键 → +，粘到「命令」里\n（命令通道：{}）",
+                                self.ipc_path
+                            ));
+                        let w = ui.available_width();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut cmd.clone())
+                                .desired_width(w)
+                                .font(FontId::monospace(10.0)),
+                        );
+                        if copy_btn.clicked() {
+                            self.status = match utils::clipboard::copy(
+                                utils::clipboard::Payload::Text(cmd.clone()),
+                            ) {
+                                Ok(_) => format!("已复制命令：{cmd}"),
+                                Err(e) => format!("复制失败：{e}"),
+                            };
+                        }
+                    });
                 });
 
+                // 页脚跟着内容流走（不再钉死到底部）：窗口高度由下面按
+                // 「内容高度 + 上下留白」算出来，底部自然也是 CONTROL_PAD
+                ui.add_space(SECTION_GAP);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Enter 截图　Esc 退出")
@@ -1528,14 +1631,33 @@ impl App {
                     self.quit = true;
                 }
             });
+
+        // 让窗口高度 = 内容 + 上下留白。
+        //
+        // 写死 CONTROL_SIZE 时，字体度量随 ppp 取整、状态文字变长
+        // 都会让底部比顶部宽（或直接裁掉最后一行）。这里按实际内容量一次，
+        // 四边 padding 就永远是同一个 CONTROL_PAD。Wayland 的 request_inner_size
+        // 只在「非 tiled / 非 fullscreen」时生效，Idle 正好满足。
+        let content_h = area.response.rect.height();
+        let wanted = (content_h + CONTROL_PAD * 2.0).ceil();
+        if wanted >= 240.0 && (screen.height() - wanted).abs() > 0.5 {
+            eprintln!(
+                "[shotrs] 控制窗口按内容调整高度：{:.0} → {:.0}（内容 {:.0}）",
+                screen.height(),
+                wanted,
+                content_h
+            );
+            let _ = window.request_inner_size(LogicalSize::new(CONTROL_SIZE.width, wanted as f64));
+        }
     }
 
-    /// 编辑器里的动作按钮（目前只有「保存」）。返回它占用的矩形
+    /// 编辑器里的动作按钮（重选 / 撤回 / 恢复 / 保存）。返回它占用的矩形
     fn ui_actions(&mut self, ctx: &egui::Context) -> Rect {
         let dir = self.config.save_dir.display().to_string();
         let mut clicked = false;
         let mut undo_clicked = false;
         let mut redo_clicked = false;
+        let mut reselect_clicked = false;
         let area = egui::Area::new(egui::Id::unique("shotrs-actions"))
             .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, 44.0))
             .show(ctx, |ui| {
@@ -1545,6 +1667,19 @@ impl App {
                     .corner_radius(8.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // 全屏截图之后选区铺满整屏，没有「外面」可以重新拖框，
+                            // 所以给一个显式入口回到框选阶段
+                            if matches!(self.phase, Phase::Annotate)
+                                && ui
+                                    .add(
+                                        egui::Button::new(RichText::new("重选").size(12.0))
+                                            .min_size(Vec2::new(46.0, 26.0)),
+                                    )
+                                    .on_hover_text("清空选区，重新框选（Shift+R）")
+                                    .clicked()
+                            {
+                                reselect_clicked = true;
+                            }
                             let can_undo = self.scene.can_undo();
                             let can_redo = self.scene.can_redo();
                             if ui
@@ -1584,6 +1719,9 @@ impl App {
         }
         if redo_clicked {
             self.scene.redo();
+        }
+        if reselect_clicked {
+            self.reset_selection();
         }
         if clicked {
             self.action = Some(Action::Save);
@@ -1685,23 +1823,12 @@ impl App {
                 if ctx.input(|i| i.key_pressed(egui::Key::S)) {
                     self.action = Some(Action::Save);
                 }
+                // 全屏选区没有「外面」可拖框，Shift+R 是显式回到框选阶段（R 给矩形工具了）
+                if shift_held(ctx) && ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                    self.reset_selection();
+                }
                 if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
-                    // 修饰键既可能来自 InputState.modifiers（真实的 ModifiersChanged），
-                    // 也可能只带在 Key 事件上（合成事件/某些输入法）—— 两边都认
-                    let shift = ctx.input(|i| {
-                        i.modifiers.shift
-                            || i.events.iter().any(|e| {
-                                matches!(
-                                    e,
-                                    egui::Event::Key {
-                                        modifiers,
-                                        pressed: true,
-                                        ..
-                                    } if modifiers.shift
-                                )
-                            })
-                    });
-                    if shift {
+                    if shift_held(ctx) {
                         self.scene.redo();
                     } else {
                         self.scene.undo();
@@ -1717,7 +1844,8 @@ impl App {
                     self.scene.remove_selected();
                 }
                 // 注：原来这里用 R 做「重选」，现在 R 分给了矩形工具；
-                // 重选改成「拖到选区外面」（见选区命中测试的 Outside 分支）
+                // 重选改成了「Shift+R / 右上角按钮」，以及全屏选区下直接拖动内部
+                // （见下面的 Inside if want_move 分支）
             }
 
             // 点在「任何 UI 层」上都不算画布操作。
@@ -1767,7 +1895,7 @@ impl App {
                                 let sel = self.sel.unwrap_or(screen);
                                 let want_move =
                                     self.toolbox.active().is_selection_tool() || space_held;
-                                let sel_hit = selection::hit(sel, p);
+                                let sel_hit = selection::hit_selection(sel, p, screen);
 
                                 // ① 选中标注右上角的删除按钮
                                 let delete_hit = match self.scene.selected {
@@ -1809,7 +1937,14 @@ impl App {
                                             self.scene.selected = None;
                                             self.sel_base = self.sel;
                                             self.sel_start = Some(p);
-                                            self.grab = Some(selection::Grab::Move);
+                                            // 全屏选区：内部拖动 = 重新框选。
+                                            // 平移会被夹回屏幕（本来就没有富余空间），
+                                            // 用户看到的就是「拖了没反应、缩不了」。
+                                            self.grab = Some(if selection::covers_screen(sel, screen) {
+                                                selection::Grab::New
+                                            } else {
+                                                selection::Grab::Move
+                                            });
                                         }
                                         selection::Hit::Inside => {
                                             if let Some(i) = self.scene.hit(p) {
@@ -1984,7 +2119,12 @@ impl App {
                 p.rect_stroke(sel, CornerRadius::ZERO, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
                 // 指针挨着边框（或正在缩放）时画把手，平时不画免得挡视线
                 let hovering_border = ptr
-                    .map(|p| matches!(selection::hit(sel, p), selection::Hit::Handle(_)))
+                    .map(|p| {
+                        matches!(
+                            selection::hit_selection(sel, p, screen),
+                            selection::Hit::Handle(_)
+                        )
+                    })
                     .unwrap_or(false);
                 if hovering_border || matches!(self.grab, Some(selection::Grab::Resize(_))) {
                     selection::draw_handles(&p, sel, ACCENT);
@@ -2031,7 +2171,7 @@ impl App {
             Phase::Annotate => {
                 let tool = self.toolbox.active();
                 format!(
-                    "工具：{}　{}　|　拖边框/角 = 缩放　空格拖动 = 移动选区　R 重选　\
+                    "工具：{}　{}　|　拖边框/角 = 缩放　空格拖动 = 移动选区　Shift+R = 重选　\
                      Z 撤销　Enter 复制　S 保存　Esc 取消",
                     tool.label(),
                     tool.hint()
@@ -2051,7 +2191,7 @@ impl App {
             // 光标形状就是最好的可见性提示：边框上变缩放箭头、能平移时变抓手
             let icon = match (self.grab, self.sel, ptr) {
                 (Some(grab), _, _) => grab.cursor(),
-                (None, Some(sel), Some(p)) => self.canvas_cursor(sel, p, space_held),
+                (None, Some(sel), Some(p)) => self.canvas_cursor(sel, p, space_held, screen),
                 _ => egui::CursorIcon::Crosshair,
             };
             ctx.set_cursor_icon(icon);
@@ -2313,6 +2453,11 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::Resized(size) => {
+                if matches!(self.phase, Phase::Idle) {
+                    // 控制窗口会按内容自动调高，这里同步一份——取帧时靠它判断
+                    // 「全屏尺寸生效了吗」
+                    self.control_size = (size.width, size.height);
+                }
                 if let Some(gl) = self.gl.as_ref() {
                     if let (Some(w), Some(h)) =
                         (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
@@ -2339,6 +2484,24 @@ impl ApplicationHandler for App {
 }
 
 // ---------------------------------------------------------------- 工具函数
+
+/// Shift 是否按住：既认 `InputState.modifiers`（真实的 `ModifiersChanged`），
+/// 也认 `Key` 事件自带的修饰键（合成事件 / 某些输入法）—— 两边都认。
+fn shift_held(ctx: &egui::Context) -> bool {
+    ctx.input(|i| {
+        i.modifiers.shift
+            || i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        modifiers,
+                        pressed: true,
+                        ..
+                    } if modifiers.shift
+                )
+            })
+    })
+}
 
 /// 选中标注时，「删除」按钮的位置：贴在选择项右上角，并且不会跑到选区外面
 fn delete_icon_center(bounds: Rect, sel: Rect) -> Pos2 {

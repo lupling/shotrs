@@ -3,7 +3,7 @@ name = "shotrs"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Rust 截图工具最小实现（技术验证）"
+description = "GNOME / Wayland 截图工具：portal 取帧 + egui 标注 + 托盘常驻（Rust / winit / OpenGL）"
 license = "MIT"
 readme = "README.md"
 

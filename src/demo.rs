@@ -12,9 +12,9 @@
 use egui::{Event, Key, Modifiers, PointerButton, Pos2};
 
 /// 控制窗口里「应用」按钮的中心（逻辑点，把保存目录写回 JSON）
-const APPLY_BUTTON: Pos2 = Pos2::new(441.3, 254.2);
+const APPLY_BUTTON: Pos2 = Pos2::new(441.5, 338.0);
 /// 控制窗口里「截图」按钮的中心（逻辑点）
-const SHOT_BUTTON: Pos2 = Pos2::new(246.0, 99.8);
+const SHOT_BUTTON: Pos2 = Pos2::new(240.0, 107.0);
 /// 属性面板里「蓝」色块的中心（逻辑点）。按钮栏/面板几何变了要跟着改
 const BLUE_CHIP: Pos2 = Pos2::new(163.0, 134.2);
 /// 按钮栏里第二个按钮（文字）的中心
@@ -88,9 +88,14 @@ impl Script {
             19 => press(Pos2::new(100.0, 900.0)),
             20 => vec![Event::PointerMoved(Pos2::new(500.0, 1000.0))],
             21 => release(Pos2::new(500.0, 1000.0)),
-            // R 重选：回到框选阶段，重新拉一块
-            22 => key(Key::R),
-            23 => press(Pos2::new(300.0, 200.0)),
+            // Shift+R 重选：回到框选阶段，重新拉一块（R 单独按是矩形工具，所以必须带 Shift）
+            22 => shift_key(Key::R),
+            23 => {
+                // 清掉 Shift 再按下，否则合成事件里的修饰键会跟着带进后面的拖动
+                let mut events = clear_modifiers();
+                events.extend(press(Pos2::new(300.0, 200.0)));
+                events
+            }
             24 => vec![Event::PointerMoved(Pos2::new(760.0, 420.0))],
             25 => release(Pos2::new(760.0, 420.0)),
             // 切到箭头工具，画一根

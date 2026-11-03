@@ -64,6 +64,11 @@ impl Toolbox {
 
     /// 快捷键切换。主程序在「没有内联编辑器、也不在打字」时每帧调一次
     pub fn handle_hotkeys(&mut self, ctx: &egui::Context) {
+        // 带修饰键的组合不是切工具：`Shift+R` 是「重选」、`Shift+Z` 是恢复。
+        // 不屏蔽的话 `key_pressed(R)` 会先把工具切成矩形，重选就永远轮不到。
+        if ctx.input(|i| i.modifiers.shift || i.modifiers.ctrl || i.modifiers.alt) {
+            return;
+        }
         let mut hotkey_switched = false;
         for (i, tool) in self.tools.iter().enumerate() {
             if let Some(key) = tool.hotkey() {

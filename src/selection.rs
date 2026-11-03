@@ -7,8 +7,19 @@ use egui::{Color32, CornerRadius, CursorIcon, Painter, Pos2, Rect, Stroke, Strok
 
 /// 边框/把手的抓取带宽（逻辑点）
 pub const BAND: f32 = 8.0;
+/// 全屏选区时加宽的抓取带宽：边框正好压在屏幕边缘，8pt 基本点不中
+pub const EDGE_BAND: f32 = 16.0;
 /// 选区最小尺寸
 pub const MIN_SIZE: f32 = 12.0;
+
+/// 选区是不是正好铺满整个屏幕（全屏截图的默认选区）
+pub fn covers_screen(sel: Rect, screen: Rect) -> bool {
+    const EPS: f32 = 1.0;
+    (sel.min.x - screen.min.x).abs() <= EPS
+        && (sel.min.y - screen.min.y).abs() <= EPS
+        && (sel.max.x - screen.max.x).abs() <= EPS
+        && (sel.max.y - screen.max.y).abs() <= EPS
+}
 
 /// 八个把手
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,7 +76,21 @@ impl Grab {
 
 /// 命中测试：角优先于边，边优先于内部
 pub fn hit(sel: Rect, p: Pos2) -> Hit {
-    let b = BAND;
+    hit_with_band(sel, p, BAND)
+}
+
+/// 选区自己的命中测试：全屏选区时边框就在屏幕边缘，把抓取带加宽，
+/// 否则用户几乎不可能在 8pt 内点中「缩回去」的那条边。
+pub fn hit_selection(sel: Rect, p: Pos2, screen: Rect) -> Hit {
+    let band = if covers_screen(sel, screen) {
+        EDGE_BAND
+    } else {
+        BAND
+    };
+    hit_with_band(sel, p, band)
+}
+
+fn hit_with_band(sel: Rect, p: Pos2, b: f32) -> Hit {
     let near_l = (p.x - sel.min.x).abs() <= b;
     let near_r = (p.x - sel.max.x).abs() <= b;
     let near_t = (p.y - sel.min.y).abs() <= b;
@@ -216,6 +241,41 @@ pub fn draw_handles(painter: &Painter, sel: Rect, accent: Color32) {
             CornerRadius::ZERO,
             Stroke::new(1.0, accent),
             StrokeKind::Inside,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen() -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0))
+    }
+
+    #[test]
+    fn covers_screen_认全屏选区() {
+        assert!(covers_screen(screen(), screen()));
+        // 少数几个像素的误差仍算全屏（裁剪/取整会带一点）
+        assert!(covers_screen(screen().shrink(0.5), screen()));
+        assert!(!covers_screen(screen().shrink(2.0), screen()));
+        assert!(!covers_screen(
+            Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(800.0, 600.0)),
+            screen()
+        ));
+    }
+
+    #[test]
+    fn 全屏选区的边框仍然能抓住() {
+        let sel = screen();
+        // 距上边缘 12pt：普通带宽（8pt）够不到，全屏带宽（16pt）能抓住
+        let p = Pos2::new(960.0, 12.0);
+        assert!(matches!(hit(sel, p), Hit::Inside));
+        assert_eq!(hit_selection(sel, p, screen()), Hit::Handle(Handle::Top));
+        // 屏幕正中间还是内部
+        assert_eq!(
+            hit_selection(sel, screen().center(), screen()),
+            Hit::Inside
         );
     }
 }

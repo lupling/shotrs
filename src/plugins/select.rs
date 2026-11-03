@@ -34,6 +34,6 @@ impl Tool for SelectTool {
     }
 
     fn hint(&self) -> &'static str {
-        "拖动 = 移动选区"
+        "拖动 = 移动选区（全屏时 = 重选）"
     }
 }
