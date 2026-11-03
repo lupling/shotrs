@@ -62,6 +62,7 @@ src/hotkey.rs           portal GlobalShortcuts 的尝试实现（host 应用多�
 src/ipc.rs              单实例 + unix socket 命令通道（--screenshot / --show）
 src/demo.rs             合成输入脚本（回归测试 / 全自动验收）
 examples/monitors.rs    探针：winit 眼里的显示器尺寸/位置/整数缩放
+examples/layout.rs      探针：Mutter DisplayConfig 的真实逻辑布局（位置/分数缩放/旋转）
 examples/probe.rs       探针：portal 实际给的多大一张图
 assets/shotrs.svg       程序图标源文件（另有 32/48/64/128/256/512 PNG 与 .ico）
 assets/shotrs.desktop   .desktop 条目（GNOME 靠 app_id 匹配它的 Icon=）
@@ -149,7 +150,10 @@ HUD 里那行「portal 临时文件 Screenshot-N.png 已清理」就是这条。
 
 ## 坐标与多屏（最大的坑）
 
-### 四层坐标
+### 四层坐标（winit 兜底路径）
+
+> GNOME 上裁剪优先走下面「现在的算法」里的 DisplayConfig 精确布局；这一节描述的是
+> 查不到 DisplayConfig 时用的 winit 估算，以及为什么单靠它已经不够。
 
 portal 返回的是**整桌面一张位图**，按「会话里最大的那个分数缩放」渲染。于是同时存在四层坐标
 （下表是副屏改 1.5 之后的实测，主屏 eDP-2 2560×1600@1.333 + 副屏 DP-2 1920×1080）：
@@ -185,12 +189,33 @@ portal 返回的是**整桌面一张位图**，按「会话里最大的那个分
      `inner_size` 重采样回设备像素（Lanczos3，方向只会是缩小，85–130 ms），日志打
      `帧 2880x1800 → 2560x1600（缩回该屏设备像素…）`。
 
-### 现在的算法
+### 现在的算法：优先问 Mutter 要精确布局
 
-**位图矩形 = (逻辑位置, 逻辑尺寸) × 桌面缩放**，裁完再重采样到 `inner_size`。
-桌面缩放优先取「全屏时观测到的分数缩放的历史最大值」；如果按它估出来的桌面比帧还小
-（典型场景：程序一开始就落在缩放较小的副屏上，从没见过主屏的 1.333），就用「让这块屏刚好装进帧」
-的上界反推一次，并打印 `桌面缩放改用反推值`。
+三屏 + 竖屏之后，**不能再靠 winit 的 monitor 几何拼桌面包围盒**：
+
+- `MonitorHandle::size()` 是**未旋转**的模式尺寸。DP-7 实际逻辑 1600×2560（旋转 90°），
+  winit 报 2560×1600。
+- 全屏时 `inner_size()` 是旋转后的 buffer 尺寸，所以「inner == monitor.size()」在竖屏上
+  永远不成立 —— 旧代码会一直重发全屏请求，1.5s 后放弃并退回整桌面。
+- `desktop_union_logical()` 用未旋转尺寸估高度，会把桌面高度估小；于是「帧比预计的桌面大」
+  被误判成「观测到的桌面缩放偏小」，触发反推。三屏下当前屏又不一定是最右/最下那块，
+  反推公式 `帧宽 / (px + 逻辑宽)` 会直接算出 2.061（真实 1.333），整块裁错。
+
+现在取帧到手后先查一次
+`org.gnome.Mutter.DisplayConfig.GetCurrentState`（`query_display_layout()`），拿到每块逻辑屏的
+**逻辑位置、分数缩放、transform、当前模式尺寸**：
+
+- 会话缩放 = 所有逻辑屏 `scale` 的最大值（portal 位图的渲染倍率），不再靠历史观测猜。
+- 逻辑尺寸 = 当前模式物理尺寸 ÷ scale；transform 为 90°/270° 时先宽高互换。
+- 位图矩形 = `(逻辑位置 - 位图原点) × 会话缩放`，裁完再重采样到 `inner_size`。
+- 全屏是否生效：直接比 DisplayConfig 算出的旋转后 buffer 尺寸（竖屏是 1600×2560）。
+- `capture_monitor` 记住本次选定的屏名，裁剪和重试都用它，避免全屏过渡期间
+  `current_monitor()` 短暂报旧屏。
+
+DBus 查询失败（非 GNOME / 服务不可用）或设置了 `SHOTRS_FAKE_MONITOR` 时，才退回原来的
+winit 估算。兜底路径也修了两处：全屏检查接受「宽高互换」（竖屏），`desktop_union_logical()`
+对旋转未知的屏取较大边当上界，避免再误触发反推。日志会打印
+`显示器布局（Mutter DisplayConfig…）` 和 `裁剪来源（DisplayConfig）`。
 
 顺带处理了 `ScaleFactorChanged`：换屏后主动按当前 `inner_size` 重配一次 GL surface
 （有些合成器不发 `Resized`），并打一行 `缩放变化` 日志。
@@ -198,12 +223,14 @@ portal 返回的是**整桌面一张位图**，按「会话里最大的那个分
 ### 探针（排查这类问题先看真值）
 
 ```bash
+cargo run --release --example layout               # Mutter DisplayConfig 的真实逻辑布局（含旋转）
 cargo run --release --example monitors             # winit 眼里的尺寸 / 位置 / 整数缩放
 SHOTRS_DUMP=1 cargo run --release --example probe  # portal 实际给的多大一张图
 ```
 
-两个都不开窗口，所以**已有实例在跑时也能用**。另外 `SHOTRS_FAKE_MONITOR` 可以在单屏上假装自己是
-另一块屏，复现混合缩放的裁切。
+三个都不开窗口，所以**已有实例在跑时也能用**。裁错时先对照 `layout` 和 `monitors`：
+如果竖屏在 `monitors` 里的宽高与 `layout` 相反，就是 winit 没把 transform 算进去（正常现象）。
+另外 `SHOTRS_FAKE_MONITOR` 可以在单屏上假装自己是另一块屏，复现混合缩放的裁切。
 
 ### 想「跟随鼠标」时的可行路线（未实现）
 
@@ -589,8 +616,20 @@ for s in 32 48 64 128 256; do magick assets/shotrs-512.png -resize ${s}x${s} -st
 
 ## 实测数据（2026-11-02 / 11-03，GNOME 50.1 / Wayland / fcitx5）
 
-别的环境未必一致。两块屏：主屏 eDP-2 2560×1600@1.333 + 副屏 DP-2 1920×1080；
-副屏 11-03 期间从 1.0 改到过 1.5（后来又改回 1.0），两套数据都留着：
+别的环境未必一致。最初是两块屏：主屏 eDP-2 2560×1600@1.333 + 副屏 DP-2 1920×1080；
+副屏 11-03 期间从 1.0 改到过 1.5（后来又改回 1.0），两套数据都留着。
+**11-03 晚新增竖屏 DP-7（2560×1600，旋转 90°，逻辑 1600×2560）**，当前是三屏：
+
+| 屏 | 逻辑位置 | 分数缩放 | 逻辑尺寸 | 设备像素 |
+|---|---|---|---|---|
+| DP-7（竖屏，transform=1） | (0,0) | 1.0 | 1600×2560 | 1600×2560 |
+| eDP-2（主屏） | (1600,0) | 1.333 | 1920×1200 | 2560×1600 |
+| DP-2 | (3520,0) | 1.0 | 1920×1080 | 1920×1080 |
+
+三屏下 portal 位图 **7253×3413** = 桌面逻辑包围盒 5440×2560 × 会话最大缩放 1.333。
+DisplayConfig 路径下：DP-7 裁 2133×3413 后缩回 1600×2560，eDP-2 裁 2560×1600，
+DP-2 裁 2560×1440 后缩回 1920×1080。旧的 winit 估算路径会把 eDP-2 裁成
+3956×2473@3297,0（真实是 2560×1600@2133,0），并把竖屏退回整桌面。
 
 | 项 | 结果 |
 |---|---|
@@ -622,8 +661,8 @@ for s in 32 48 64 128 256; do magick assets/shotrs-512.png -resize ${s}x${s} -st
 | `SHOTRS_DUMP=1` | 冻结帧 → `/tmp/shotrs-frame.png`；编辑器稳定后 → `/tmp/shotrs-backbuffer.png`；空闲态 → `/tmp/shotrs-control.png`（控制窗口 UI 快照）；演示模式则每帧一张 `/tmp/shotrs-demo-NN.png` |
 
 `SHOTRS_DUMP` 那两张图是排「显示不对」最快的手段：可直接按不同缩放系数采样比对，判断是自己画错了
-还是帧本身就是错的。混合缩放的坑优先用 `examples/monitors.rs` / `examples/probe.rs` 这两个探针对真值
-（见上文「探针」）。
+还是帧本身就是错的。混合缩放 / 竖屏的坑优先用 `examples/layout.rs` / `examples/monitors.rs` /
+`examples/probe.rs` 这三个探针对真值（见上文「探针」）。
 
 `SHOTRS_SMOKE=1` 会打印 `已复制 2560x1600 到剪贴板` 然后自己退出（正常模式是回到小窗口）。
 脚本里想验证存盘，就再按一次 `S`。

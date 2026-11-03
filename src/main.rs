@@ -155,13 +155,19 @@ struct App {
     /// 已取到但还没裁剪/上传的帧（等窗口进全屏、尺寸生效）
     pending: Option<Frame>,
     pending_frames: u32,
+    /// 本次截图的显示器布局（Mutter DisplayConfig 查到的精确逻辑矩形）。
+    /// 拿不到时为 None，退回 winit 的估算路径。
+    pending_layout: Option<DisplayLayout>,
+    /// 本次全屏到哪块屏（显示器名字）。裁剪/尺寸检查都以它为准，
+    /// 避免全屏切换过程中 `current_monitor()` 短暂报旧屏。
+    capture_monitor: Option<String>,
     /// 进全屏前记下的控制窗口物理尺寸，用来判断「全屏尺寸还没生效」
     control_size: (u32, u32),
     /// 冻结帧的像素尺寸（瓦片坐标基于此，绘制时要换算成逻辑点）
     frame_size: (usize, usize),
     /// portal 位图用的缩放：GNOME 把整桌面按会话里最大的分数缩放渲染成一张位图。
-    /// 我们能在全屏时观察到「当前屏的分数缩放」，取历史最大值当它
-    /// （起点是控制窗口所在的屏，通常就是主屏 = 最大缩放）。
+    /// 精确值来自 DisplayConfig（`pending_layout.max_scale`）；拿不到时退回
+    /// 「全屏时观测到的当前屏分数缩放的历史最大值」。
     desktop_scale: f32,
     tiles: Vec<Tile>,
 
@@ -270,6 +276,8 @@ impl App {
             capture_rx: None,
             pending: None,
             pending_frames: 0,
+            pending_layout: None,
+            capture_monitor: None,
             control_size: (0, 0),
             frame_size: (0, 0),
             desktop_scale: 1.0,
@@ -730,6 +738,19 @@ impl App {
                 self.pending = Some(frame);
                 self.pending_since = Some(Instant::now());
                 self.pending_frames = 0;
+                // 取帧到手后查一次精确的显示器布局（含旋转/分数缩放）。
+                // SHOTRS_FAKE_MONITOR 是调试单屏几何用的，走旧的估算路径。
+                if std::env::var_os("SHOTRS_FAKE_MONITOR").is_none() {
+                    self.pending_layout = query_display_layout();
+                    if let Some(layout) = &self.pending_layout {
+                        self.desktop_scale = self.desktop_scale.max(layout.max_scale);
+                        eprintln!("[shotrs] {}", layout.describe());
+                    } else {
+                        eprintln!("[shotrs] 拿不到 Mutter DisplayConfig 布局，退回 winit 几何估算");
+                    }
+                } else {
+                    self.pending_layout = None;
+                }
                 self.enter_editor(window);
             }
             Err(e) => {
@@ -743,6 +764,7 @@ impl App {
     /// 进全屏编辑器：把窗口显示出来并切全屏（取帧已完成，此时切换不会影响画面）
     fn enter_editor(&mut self, window: &Window) {
         let monitor = self.pick_monitor(window);
+        self.capture_monitor = monitor.as_ref().and_then(|m| m.name());
         eprintln!(
             "[shotrs] 全屏到 {}",
             monitor
@@ -761,6 +783,8 @@ impl App {
     fn back_to_control(&mut self, window: &Window) {
         self.pending = None;
         self.pending_frames = 0;
+        self.pending_layout = None;
+        self.capture_monitor = None;
         self.sel = None;
         self.sel_start = None;
         self.draft = None;
@@ -845,18 +869,39 @@ impl App {
             return;
         };
 
-        // 「全屏生效了吗」= 窗口尺寸是否已经等于当前显示器的尺寸。
+        // 「全屏生效了吗」= 窗口尺寸是否已经等于目标屏的设备像素。
         //
         // 不能用「比记录的控制窗口大」来判断：上一张截图刚结束时 inner_size 还是上一块屏的
         // 全屏尺寸，于是第二次点「截图」会被误判成「已经全屏」，随后错误地退回整桌面。
+        //
+        // 竖屏的坑：winit 的 `monitor.size()` 返回的是**未旋转**的模式尺寸（DP-7 实际
+        // 1600×2560，它报 2560×1600），直接比较会永远不相等。DisplayConfig 给了
+        // transform，能算出旋转后的 buffer 尺寸；拿不到时退而接受「宽高互换」也算生效。
         let inner = window.inner_size();
+        let target_name = self
+            .capture_monitor
+            .clone()
+            .or_else(|| window.current_monitor().and_then(|m| m.name()));
+        let layout_target = self.pending_layout.as_ref().and_then(|layout| {
+            target_name
+                .as_deref()
+                .and_then(|name| layout.monitor(name))
+        });
+        let expected_size = layout_target.map(|m| m.pixel);
         let monitor_size = window
             .current_monitor()
             .map(|m| (m.size().width, m.size().height));
-        let fullscreen_applied = match monitor_size {
+        let fullscreen_applied = match expected_size {
             Some((mw, mh)) => inner.width == mw && inner.height == mh,
-            // 拿不到显示器信息时退回弱判断
-            None => inner.width > self.control_size.0 || inner.height > self.control_size.1,
+            None => match monitor_size {
+                // 竖屏时 inner 与 monitor.size() 的宽高是互换的
+                Some((mw, mh)) => {
+                    (inner.width == mw && inner.height == mh)
+                        || (inner.width == mh && inner.height == mw)
+                }
+                // 拿不到显示器信息时退回弱判断
+                None => inner.width > self.control_size.0 || inner.height > self.control_size.1,
+            },
         };
         let waited = self.pending_since.map(|t| t.elapsed()).unwrap_or_default();
         if !fullscreen_applied && waited < Duration::from_millis(1500) {
@@ -865,10 +910,22 @@ impl App {
                 if self.pending_frames > 0 {
                     eprintln!(
                         "[shotrs] 全屏未生效（inner={}x{} 目标={:?}），重试",
-                        inner.width, inner.height, monitor_size
+                        inner.width,
+                        inner.height,
+                        expected_size.or(monitor_size)
                     );
                 }
-                window.set_fullscreen(Some(Fullscreen::Borderless(self.pick_monitor(window))));
+                // 优先按本次已经选定的屏重发，避免过渡期间 current_monitor 漂移
+                let target = self
+                    .capture_monitor
+                    .as_deref()
+                    .and_then(|name| {
+                        window
+                            .available_monitors()
+                            .find(|m| m.name().as_deref() == Some(name))
+                    })
+                    .or_else(|| self.pick_monitor(window));
+                window.set_fullscreen(Some(Fullscreen::Borderless(target)));
             }
             self.pending = Some(frame);
             self.pending_frames += 1;
@@ -883,7 +940,16 @@ impl App {
             eprintln!("[shotrs] {msg}");
             self.status = msg;
         } else {
-            match monitor_bitmap_rect(window, self.desktop_scale, full) {
+            // 首选 DisplayConfig 的精确布局：逻辑矩形 × 会话最大缩放。它同时解决了
+            // 三屏、竖屏旋转、当前屏不是最右/最下那块时的反推错误。
+            // 拿不到（非 GNOME / DBus 不可用）才退回 winit 估算。
+            let exact = self.pending_layout.as_ref().and_then(|layout| {
+                let name = target_name.as_deref()?;
+                let target = layout.monitor(name)?;
+                layout.bitmap_rect(target, name, full)
+            });
+            let rect = exact.or_else(|| monitor_bitmap_rect(window, self.desktop_scale, full));
+            match rect {
                 Some((cx, cy, cw, ch)) => {
                     match crop_rgba(&frame.rgba, frame.width, frame.height, cx, cy, cw, ch) {
                         Some(cropped) => {
@@ -2566,7 +2632,237 @@ fn monitor_logical_origin(m: &winit::monitor::MonitorHandle) -> (f32, f32) {
     (p.x as f32 / int_scale, p.y as f32 / int_scale)
 }
 
-/// 当前屏在 portal 位图里的矩形（位图像素）。
+/// 一块逻辑显示器（可能由多块物理屏镜像而成）的精确几何。
+struct LogicalMonitorLayout {
+    connectors: Vec<String>,
+    /// 逻辑坐标（Mutter DisplayConfig 原始坐标，可能不是从 0 开始）
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    /// 全屏 surface 的设备像素尺寸（已按 transform 旋转）
+    pixel: (u32, u32),
+    /// Mutter 的 transform 编码：奇数 = 90°/270°，宽高互换
+    transform: u32,
+}
+
+impl LogicalMonitorLayout {
+    fn has_connector(&self, name: &str) -> bool {
+        self.connectors.iter().any(|c| c == name)
+    }
+}
+
+/// Mutter `org.gnome.Mutter.DisplayConfig.GetCurrentState` 给出的整桌布局。
+///
+/// 这是修三屏 / 竖屏问题的关键：winit 0.30 的 `monitor.size()` 报的是**未旋转**的
+/// 模式尺寸（竖屏 DP-7 实际 1600×2560，它报 2560×1600），`position()` 又乘过整数缩放，
+/// 拼出来的桌面包围盒会偏小，进而误触发「桌面缩放反推」。DisplayConfig 直接给
+/// 逻辑位置、分数缩放和 transform，没有这些歧义。
+struct DisplayLayout {
+    monitors: Vec<LogicalMonitorLayout>,
+    /// 会话里最大的分数缩放 = portal 位图的渲染倍率
+    max_scale: f32,
+}
+
+impl DisplayLayout {
+    fn monitor(&self, name: &str) -> Option<&LogicalMonitorLayout> {
+        self.monitors.iter().find(|m| m.has_connector(name))
+    }
+
+    fn describe(&self) -> String {
+        let mut s = format!(
+            "显示器布局（Mutter DisplayConfig，会话缩放 {:.3}）：",
+            self.max_scale
+        );
+        for m in &self.monitors {
+            s.push_str(&format!(
+                "{} {}x{}@{},{} 像素 {}x{} transform={}；",
+                m.connectors.join("+"),
+                m.w.round(),
+                m.h.round(),
+                m.x,
+                m.y,
+                m.pixel.0,
+                m.pixel.1,
+                m.transform
+            ));
+        }
+        s
+    }
+
+    /// portal 位图的坐标原点。Mutter 的布局可能整体偏移（甚至为负），而 portal
+    /// 返回的是「整桌面包围盒」。用帧尺寸判断它到底按 `min(x,y)` 还是按 `(0,0)` 起算。
+    fn bitmap_origin(&self, frame: (usize, usize)) -> (f32, f32) {
+        let min_x = self.monitors.iter().map(|m| m.x).fold(f32::INFINITY, f32::min);
+        let min_y = self.monitors.iter().map(|m| m.y).fold(f32::INFINITY, f32::min);
+        let max_x = self
+            .monitors
+            .iter()
+            .map(|m| m.x + m.w)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_y = self
+            .monitors
+            .iter()
+            .map(|m| m.y + m.h)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let s = self.max_scale;
+        let d = |origin: (f32, f32)| -> i64 {
+            let w = ((max_x - origin.0) * s).round() as i64;
+            let h = ((max_y - origin.1) * s).round() as i64;
+            (w - frame.0 as i64).abs() + (h - frame.1 as i64).abs()
+        };
+        let by_min = (min_x, min_y);
+        let by_zero = (0.0, 0.0);
+        if d(by_min) <= d(by_zero) {
+            by_min
+        } else {
+            by_zero
+        }
+    }
+
+    /// 目标屏在 portal 位图里的矩形（位图像素）。
+    fn bitmap_rect(
+        &self,
+        target: &LogicalMonitorLayout,
+        name: &str,
+        frame: (usize, usize),
+    ) -> Option<(usize, usize, usize, usize)> {
+        let s = self.max_scale;
+        let (ox, oy) = self.bitmap_origin(frame);
+        let x0 = ((target.x - ox) * s).round();
+        let y0 = ((target.y - oy) * s).round();
+        let x1 = ((target.x - ox + target.w) * s).round();
+        let y1 = ((target.y - oy + target.h) * s).round();
+        if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
+            return None;
+        }
+        let (x0, y0) = (x0.max(0.0) as usize, y0.max(0.0) as usize);
+        let (x1, y1) = (x1.max(0.0) as usize, y1.max(0.0) as usize);
+        let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        if cw == 0 || ch == 0 || x1 > frame.0 || y1 > frame.1 {
+            eprintln!(
+                "[shotrs] DisplayConfig 裁剪区 {cw}x{ch}@({x0},{y0}) 超出取帧 {}x{}",
+                frame.0, frame.1
+            );
+            return None;
+        }
+        eprintln!(
+            "[shotrs] 裁剪来源（DisplayConfig） {name} 逻辑 {}x{}@{},{} × 会话缩放 {s:.3} = {cw}x{ch}@{x0},{y0}",
+            target.w.round(),
+            target.h.round(),
+            target.x,
+            target.y
+        );
+        Some((x0, y0, cw, ch))
+    }
+}
+
+/// Mutter 的 transform 编码 → 全屏 buffer 的物理尺寸。
+///
+/// 0/2/4/6 不改变宽高；1/3/5/7（90°/270° 及其翻转）交换宽高。用于把模式尺寸
+/// （未旋转）换算成全屏 surface 的 buffer 尺寸，也用于 `query_display_layout` 的逻辑尺寸。
+fn monitor_buffer_size(mode: (i32, i32), transform: u32) -> (u32, u32) {
+    let (w, h) = (mode.0.max(1) as u32, mode.1.max(1) as u32);
+    if transform % 2 == 1 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// 查询 Mutter 的显示器布局。失败（非 GNOME / DBus 不通）返回 None，调用方走估算路径。
+///
+/// 只从 DisplayConfig 里取三样东西：逻辑位置、分数缩放、transform。模式尺寸用来算
+/// 逻辑尺寸（`物理像素 ÷ 缩放`，旋转时先宽高互换）。
+fn query_display_layout() -> Option<DisplayLayout> {
+    use std::collections::HashMap;
+    use zbus::zvariant::OwnedValue;
+
+    type Spec = (String, String, String, String);
+    type Mode = (
+        String,
+        i32,
+        i32,
+        f64,
+        f64,
+        Vec<f64>,
+        HashMap<String, OwnedValue>,
+    );
+    type Monitor = (Spec, Vec<Mode>, HashMap<String, OwnedValue>);
+    type LogicalMonitor = (
+        i32,
+        i32,
+        f64,
+        u32,
+        bool,
+        Vec<Spec>,
+        HashMap<String, OwnedValue>,
+    );
+
+    let conn = zbus::blocking::Connection::session().ok()?;
+    let proxy = zbus::blocking::Proxy::new(
+        &conn,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .ok()?;
+    let (_serial, monitors, logical, _props): (
+        u32,
+        Vec<Monitor>,
+        Vec<LogicalMonitor>,
+        HashMap<String, OwnedValue>,
+    ) = proxy.call("GetCurrentState", &()).ok()?;
+
+    // connector -> 当前模式的物理尺寸（未旋转）
+    let mut current: HashMap<String, (i32, i32)> = HashMap::new();
+    for (spec, modes, _) in &monitors {
+        if let Some(mode) = modes.iter().find(|m| m.6.contains_key("is-current")) {
+            current.insert(spec.0.clone(), (mode.1, mode.2));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut max_scale = 1.0f32;
+    for (x, y, scale, transform, _primary, specs, _) in logical {
+        let scale = scale as f32;
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        max_scale = max_scale.max(scale);
+        let mut pixel = None;
+        for spec in &specs {
+            if let Some(&mode) = current.get(&spec.0) {
+                pixel = Some(monitor_buffer_size(mode, transform));
+                break;
+            }
+        }
+        // 任何一块屏拿不到当前模式就不猜了，整体退回 winit 路径
+        let pixel = pixel?;
+        out.push(LogicalMonitorLayout {
+            connectors: specs.iter().map(|s| s.0.clone()).collect(),
+            x: x as f32,
+            y: y as f32,
+            w: pixel.0 as f32 / scale,
+            h: pixel.1 as f32 / scale,
+            pixel,
+            transform,
+        });
+    }
+
+    if out.is_empty() {
+        return None;
+    }
+    Some(DisplayLayout {
+        monitors: out,
+        max_scale,
+    })
+}
+
+/// 当前屏在 portal 位图里的矩形（位图像素）—— **DisplayConfig 拿不到时的兜底路径**。
+///
+/// GNOME 上优先用 `DisplayLayout::bitmap_rect()`：winit 的 `monitor.size()` 不含旋转，
+/// 三屏 + 竖屏时这套估算会误判（见 `DisplayLayout` 的注释）。
 ///
 /// 坐标系有四层，实测（GNOME 50 + winit 0.30，2560×1600@1.333 主屏 + 1920×1080@1.5 副屏）：
 ///   * `inner_size()`           全屏时 = 该屏的设备像素        （主屏 2560×1600，副屏 1920×1080）
@@ -2656,24 +2952,28 @@ fn monitor_bitmap_rect(
     Some((cx, cy, cw, ch))
 }
 
-/// 按 winit 给的信息粗估桌面逻辑尺寸。
+/// 按 winit 给的信息粗估桌面包围盒，只给「帧是不是比预计的大」当兜底判断。
 ///
-/// 只用来判断「帧是不是比预计的大」：Wayland 分数缩放下 winit 报的是整数缩放（偏大），
-/// 所以逻辑尺寸会估**偏小** —— 这个方向的误差是安全的（宁可多触发一次反推）。
-/// 位置用的是 `monitor.position()`（逻辑 × 整数缩放，见 `monitor_logical_origin`），不除回来，
-/// 因为这个函数只要一个「量级」：偏大偏小都会影响判断，宁可在宽度上偏大、高度上偏小。
-/// 真正拿来算裁剪的是 `monitor_bitmap_rect` 里那套精确几何，别引用这里的值。
+/// 这个估算**不可靠**，只能当上界用：
+///   * `monitor.size()` 是**未旋转**的模式尺寸，竖屏会把宽高报反（DP-7 实际 1600×2560，
+///     winit 报 2560×1600）；不知道朝向时取 `max(逻辑宽, 逻辑高)` 当两边上界。
+///   * 分数缩放低于整数缩放时（1.333 报 2），逻辑尺寸会被估小。
+///
+/// 所以它只会用来「确认帧确实比桌面还大 → 观测到的桌面缩放偏小」，不能反过来当精确几何。
+/// 精确裁剪优先走 `DisplayLayout`（Mutter DisplayConfig），拿不到才用这里。
 fn desktop_union_logical(window: &Window) -> (f32, f32) {
     let mut w = 1.0f32;
     let mut h = 1.0f32;
     for m in window.available_monitors() {
-        let p = m.position();
+        let (px, py) = monitor_logical_origin(&m);
         let sz = m.size();
         let sc = (m.scale_factor() as f32).max(0.5);
         let lw = sz.width as f32 / sc;
         let lh = sz.height as f32 / sc;
-        w = w.max(p.x.max(0) as f32 + lw);
-        h = h.max(p.y.max(0) as f32 + lh);
+        // 旋转未知：取较大的边当两个方向的上界，避免把竖屏的桌面高度估小后误触发反推
+        let side = lw.max(lh);
+        w = w.max(px.max(0.0) + side);
+        h = h.max(py.max(0.0) + side);
     }
     (w, h)
 }
@@ -2829,4 +3129,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(Some(ipc_rx), ipc_path.display().to_string());
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn logical(
+        name: &str,
+        x: f32,
+        y: f32,
+        pixel: (u32, u32),
+        scale: f32,
+        transform: u32,
+    ) -> LogicalMonitorLayout {
+        LogicalMonitorLayout {
+            connectors: vec![name.to_string()],
+            x,
+            y,
+            w: pixel.0 as f32 / scale,
+            h: pixel.1 as f32 / scale,
+            pixel,
+            transform,
+        }
+    }
+
+    /// 当前三屏布局的回归：竖屏 DP-7 + 1.333 主屏 + 1.0 副屏。
+    /// portal 帧 = 5440×2560 逻辑 × 1.333 = 7253×3413。
+    #[test]
+    fn three_monitors_with_portrait() {
+        let s = 1.333_333_4;
+        let layout = DisplayLayout {
+            monitors: vec![
+                logical("DP-7", 0.0, 0.0, (1600, 2560), 1.0, 1),
+                logical("eDP-2", 1600.0, 0.0, (2560, 1600), s, 0),
+                logical("DP-2", 3520.0, 0.0, (1920, 1080), 1.0, 0),
+            ],
+            max_scale: s,
+        };
+        let frame = (7253, 3413);
+
+        let dp7 = layout.monitor("DP-7").unwrap();
+        assert_eq!((dp7.w, dp7.h), (1600.0, 2560.0));
+        assert_eq!(layout.bitmap_rect(dp7, "DP-7", frame), Some((0, 0, 2133, 3413)));
+
+        let edp = layout.monitor("eDP-2").unwrap();
+        assert_eq!(layout.bitmap_rect(edp, "eDP-2", frame), Some((2133, 0, 2560, 1600)));
+
+        let dp2 = layout.monitor("DP-2").unwrap();
+        assert_eq!(layout.bitmap_rect(dp2, "DP-2", frame), Some((4693, 0, 2560, 1440)));
+    }
+
+    /// transform 的宽高互换规则：90°/270°（及翻转版）交换，0°/180° 不交换。
+    #[test]
+    fn transform_buffer_size() {
+        let mode = (2560, 1600);
+        for transform in [0, 2, 4, 6] {
+            assert_eq!(monitor_buffer_size(mode, transform), (2560, 1600));
+        }
+        for transform in [1, 3, 5, 7] {
+            assert_eq!(monitor_buffer_size(mode, transform), (1600, 2560));
+        }
+    }
+
+    /// 布局整体为负时，portal 位图的原点要跟着平移。
+    #[test]
+    fn negative_layout_origin() {
+        let layout = DisplayLayout {
+            monitors: vec![
+                logical("left", -1600.0, 0.0, (1600, 1000), 1.0, 0),
+                logical("main", 0.0, 0.0, (1920, 1080), 1.0, 0),
+            ],
+            max_scale: 1.0,
+        };
+        let frame = (3520, 1080);
+        assert_eq!(layout.bitmap_origin(frame), (-1600.0, 0.0));
+        let main = layout.monitor("main").unwrap();
+        assert_eq!(layout.bitmap_rect(main, "main", frame), Some((1600, 0, 1920, 1080)));
+    }
 }

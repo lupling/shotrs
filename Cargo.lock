@@ -2256,6 +2256,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "winit",
+ "zbus",
 ]
 
 [[package]]
