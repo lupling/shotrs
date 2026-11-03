@@ -1,0 +1,32 @@
+[package]
+name = "shotrs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Rust 截图工具最小实现（技术验证）"
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
+raw-window-handle = "0.6"
+
+egui = "0.37"
+egui-winit = "0.37"
+egui_glow = "0.37"
+
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+ashpd = { version = "0.13", features = ["screenshot", "global_shortcuts"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+arboard = "3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+ksni = { version = "0.3.7", features = ["blocking"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

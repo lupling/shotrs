@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Remmina (X11)
+Name[zh_CN]=Remmina（X11 剪贴板）
+Comment=Run Remmina through XWayland for clipboard compatibility
+Comment[zh_CN]=使用 XWayland 启动 Remmina，避开原生 Wayland 剪贴板异常
+Exec=env GDK_BACKEND=x11 remmina --gapplication-app-id=org.remmina.Remmina.ShotrsX11 %U
+TryExec=remmina
+Icon=org.remmina.Remmina
+Terminal=false
+DBusActivatable=false
+Categories=GTK;Network;RemoteAccess;
+Keywords=remote desktop;rdp;x11;clipboard;
+StartupWMClass=org.remmina.Remmina

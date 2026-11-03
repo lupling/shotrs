@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=shotrs
+Name[zh_CN]=shotrs 截图
+Comment=Rust screenshot & annotate tool (verification build)
+Comment[zh_CN]=Rust 截图 + 标注工具（技术验证版）
+# Exec 用占位符，install-icon.sh 会把它换成这台机器的真实路径
+Exec=@SHOTRS_BIN@
+Icon=shotrs
+Terminal=false
+Categories=Graphics;
+Keywords=screenshot;capture;annotate;
+StartupWMClass=shotrs

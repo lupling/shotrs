@@ -1,0 +1,13 @@
+# Rust 构建产物（target/ 有 4GB，绝对不能进仓库）
+/target
+
+# 运行期 / 调试产物
+*.ppm
+*.log
+/tmp
+
+# 编辑器与系统垃圾
+.vscode/
+.idea/
+*.swp
+.DS_Store

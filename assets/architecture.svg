@@ -1,0 +1,149 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 860" width="1240" height="860" font-family="Noto Sans CJK SC, Source Han Sans SC, sans-serif">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#ff5a5a"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#6b7488"/>
+    </marker>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b1d26"/>
+      <stop offset="1" stop-color="#12131a"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1240" height="860" fill="url(#bg)"/>
+
+  <!-- 标题 -->
+  <text x="48" y="58" fill="#f2f4f8" font-size="30" font-weight="700">shotrs 架构与流程</text>
+  <text x="48" y="88" fill="#8891a6" font-size="15">左：一次截图的完整链路　右：模块职责　下：状态机</text>
+
+  <!-- ================= 左：流程 ================= -->
+  <text x="48" y="126" fill="#ff7b7b" font-size="14" font-weight="700" letter-spacing="1">运行链路</text>
+
+  <!-- 1 -->
+  <rect x="48" y="140" width="540" height="64" rx="12" fill="#232634" stroke="#3b4152"/>
+  <text x="72" y="168" fill="#e8eaf0" font-size="17" font-weight="600">用户点「截图」</text>
+  <text x="72" y="190" fill="#8b93a8" font-size="13">控制窗口 Idle：按钮 / Enter</text>
+
+  <!-- 2 -->
+  <rect x="48" y="228" width="540" height="64" rx="12" fill="#2a2230" stroke="#7a3346"/>
+  <text x="72" y="256" fill="#ffb3b3" font-size="17" font-weight="600">Capturing：先把自己变透明</text>
+  <text x="72" y="278" fill="#a48f9a" font-size="13">Wayland 下 set_visible 是空实现，只能靠 alpha=0 隐身</text>
+
+  <!-- 3 -->
+  <rect x="48" y="316" width="540" height="64" rx="12" fill="#232634" stroke="#3b4152"/>
+  <text x="72" y="344" fill="#e8eaf0" font-size="17" font-weight="600">capture.rs → portal 取帧</text>
+  <text x="72" y="366" fill="#8b93a8" font-size="13">常驻线程 + 单 runtime；modal=false；10s 超时 + 15s 看门狗</text>
+
+  <!-- 4 -->
+  <rect x="48" y="404" width="540" height="64" rx="12" fill="#232634" stroke="#3b4152"/>
+  <text x="72" y="432" fill="#e8eaf0" font-size="17" font-weight="600">裁出当前屏 + 切瓦片上传纹理</text>
+  <text x="72" y="454" fill="#8b93a8" font-size="13">位图矩形 = 逻辑位置/尺寸 × 桌面缩放；单纹理超出 GL_MAX_TEXTURE_SIZE 就切块</text>
+
+  <!-- 5 -->
+  <rect x="48" y="492" width="540" height="64" rx="12" fill="#232634" stroke="#3b4152"/>
+  <text x="72" y="520" fill="#e8eaf0" font-size="17" font-weight="600">Select → Annotate</text>
+  <text x="72" y="542" fill="#8b93a8" font-size="13">拖边框/角缩放、空格或选区工具平移、R 重选；插件负责画</text>
+
+  <!-- 6 -->
+  <rect x="48" y="580" width="256" height="70" rx="12" fill="#1f3327" stroke="#2f6b45"/>
+  <text x="70" y="610" fill="#bfe8cf" font-size="16" font-weight="600">Enter → 剪贴板</text>
+  <text x="70" y="632" fill="#7fae92" font-size="12">image / file / path 三选一</text>
+
+  <rect x="332" y="580" width="256" height="70" rx="12" fill="#1f2a3d" stroke="#2f5a8a"/>
+  <text x="354" y="610" fill="#bcd6f5" font-size="16" font-weight="600">S / 保存 → save_dir</text>
+  <text x="354" y="632" fill="#7f9cbe" font-size="12">只写盘，留在编辑器继续改</text>
+
+  <!-- 流程箭头 -->
+  <g stroke="#ff5a5a" stroke-width="2.5" marker-end="url(#a)" fill="none">
+    <path d="M318 204 L318 226"/>
+    <path d="M318 292 L318 314"/>
+    <path d="M318 380 L318 402"/>
+    <path d="M318 468 L318 490"/>
+    <path d="M250 556 L250 578"/>
+    <path d="M410 556 L410 578"/>
+  </g>
+
+  <!-- ================= 右：模块 ================= -->
+  <text x="648" y="126" fill="#7cc7ff" font-size="14" font-weight="700" letter-spacing="1">模块</text>
+
+  <rect x="648" y="140" width="544" height="72" rx="12" fill="#1d2a3a" stroke="#2f5a8a"/>
+  <text x="672" y="170" fill="#cfe4ff" font-size="17" font-weight="700">main.rs</text>
+  <text x="672" y="194" fill="#8fa9c9" font-size="13">窗口 / GL / 输入状态机 / 读回导出 —— 只认接口，不认识具体工具</text>
+
+  <!-- 总线：main.rs 分发到各模块 -->
+  <path d="M648 176 L632 176 L632 596" stroke="#6b7488" stroke-width="1.6" fill="none" stroke-dasharray="5 4"/>
+
+  <g stroke="#6b7488" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#ag)">
+    <path d="M632 256 L646 256"/>
+    <path d="M632 324 L646 324"/>
+    <path d="M632 392 L646 392"/>
+    <path d="M632 460 L646 460"/>
+    <path d="M632 528 L646 528"/>
+    <path d="M632 596 L646 596"/>
+  </g>
+
+  <g font-size="14">
+    <rect x="648" y="228" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="252" fill="#e8eaf0" font-weight="600">toolbar/</text>
+    <text x="668" y="272" fill="#8b93a8" font-size="12">按钮栏 + 属性面板 · 拖动排序 · 快捷键（条目全由注册表生成）</text>
+
+    <rect x="648" y="296" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="320" fill="#e8eaf0" font-weight="600">plugins/</text>
+    <text x="668" y="340" fill="#8b93a8" font-size="12">Tool / Draft / InlineEditor / Settings / Shape + 注册表（箭头·文字·选区）</text>
+
+    <rect x="648" y="364" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="388" fill="#e8eaf0" font-weight="600">scene.rs</text>
+    <text x="668" y="408" fill="#8b93a8" font-size="12">Vec&lt;Box&lt;dyn Shape&gt;&gt; · 落定顺序 / 撤销 / 按选区裁剪</text>
+
+    <rect x="648" y="432" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="456" fill="#e8eaf0" font-weight="600">selection.rs</text>
+    <text x="668" y="476" fill="#8b93a8" font-size="12">命中测试（8 把手/边/内/外）· 平移 · 缩放 · 夹紧与最小尺寸</text>
+
+    <rect x="648" y="500" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="524" fill="#e8eaf0" font-weight="600">capture.rs</text>
+    <text x="668" y="544" fill="#8b93a8" font-size="12">常驻取帧线程 + 单 runtime（ashpd 的 zbus 连接不能跨 runtime）· 超时</text>
+
+    <rect x="648" y="568" width="544" height="56" rx="10" fill="#232634" stroke="#3b4152"/>
+    <text x="668" y="592" fill="#e8eaf0" font-weight="600">utils/</text>
+    <text x="668" y="612" fill="#8b93a8" font-size="12">clipboard（image/file/path）· save · png（无 alpha）· config（本地 JSON）</text>
+  </g>
+
+  <!-- ================= 底：状态机 ================= -->
+  <text x="48" y="700" fill="#c8a2ff" font-size="14" font-weight="700" letter-spacing="1">状态机</text>
+
+  <g font-size="15">
+    <rect x="48" y="716" width="150" height="52" rx="26" fill="#232634" stroke="#3b4152"/>
+    <text x="123" y="748" fill="#e8eaf0" text-anchor="middle" font-weight="600">Idle</text>
+
+    <rect x="258" y="716" width="170" height="52" rx="26" fill="#2a2230" stroke="#7a3346"/>
+    <text x="343" y="748" fill="#ffb3b3" text-anchor="middle" font-weight="600">Capturing</text>
+
+    <rect x="488" y="716" width="150" height="52" rx="26" fill="#232634" stroke="#3b4152"/>
+    <text x="563" y="748" fill="#e8eaf0" text-anchor="middle" font-weight="600">Select</text>
+
+    <rect x="698" y="716" width="170" height="52" rx="26" fill="#232634" stroke="#3b4152"/>
+    <text x="783" y="748" fill="#e8eaf0" text-anchor="middle" font-weight="600">Annotate</text>
+
+    <rect x="928" y="716" width="264" height="52" rx="26" fill="#1f3327" stroke="#2f6b45"/>
+    <text x="1060" y="748" fill="#bfe8cf" text-anchor="middle" font-weight="600">复制 / 保存 → 回 Idle</text>
+  </g>
+
+  <g stroke="#ff5a5a" stroke-width="2.2" marker-end="url(#a)" fill="none">
+    <path d="M198 742 L256 742"/>
+    <path d="M428 742 L486 742"/>
+    <path d="M638 742 L696 742"/>
+    <path d="M868 742 L926 742"/>
+  </g>
+  <g fill="#8891a6" font-size="12">
+    <text x="200" y="732">点截图</text>
+    <text x="430" y="732">帧到手 + 全屏</text>
+    <text x="640" y="732">松开</text>
+    <text x="870" y="732">Enter / S</text>
+  </g>
+  <path d="M783 768 C 783 812, 123 812, 123 770" stroke="#6b7488" stroke-width="1.6" fill="none"
+        stroke-dasharray="5 4" marker-end="url(#ag)"/>
+  <rect x="352" y="800" width="196" height="20" fill="#15161c"/>
+  <text x="450" y="815" fill="#8891a6" font-size="12" text-anchor="middle">Esc 取消 / 导出完成</text>
+</svg>
